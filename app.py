@@ -1,11 +1,13 @@
 import sys
 import os
 import json
+import re
 import time
 import subprocess
 import threading
 import queue
 import shutil
+import logging
 from pathlib import Path
 
 from PyQt6.QtWidgets import (QApplication, QSystemTrayIcon, QMenu, 
@@ -20,6 +22,25 @@ import winreg
 
 CONFIG_FILE = "config.json"
 APP_NAME = "AdrenalinSplitter"
+
+# --- Logging setup ---
+def _setup_logging():
+    log_dir = Path(os.environ.get('APPDATA', '.')) / APP_NAME
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "muxer_debug.log"
+    logger = logging.getLogger("muxer")
+    logger.setLevel(logging.DEBUG)
+    # Ротация: перезаписываем лог при каждом запуске
+    fh = logging.FileHandler(str(log_file), mode='w', encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter('%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s',
+                            datefmt='%H:%M:%S')
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.info(f"Log started. File: {log_file}")
+    return logger
+
+log = _setup_logging()
 
 TRANSLATIONS = {
     "ru": {
@@ -209,21 +230,30 @@ class ConfigManager:
 class Muxer(QObject):
     mux_finished = pyqtSignal(str, bool, str)
     queue_progress = pyqtSignal(int, int)
+    file_progress = pyqtSignal(int)
 
     def __init__(self, config_manager):
         super().__init__()
         self.config = config_manager
         self.ffmpeg_path = self._get_ffmpeg_path()
+        log.info(f"FFmpeg path: {self.ffmpeg_path}")
         
         self.task_queue = queue.Queue()
         self.total_tasks_in_batch = 0
         self.completed_in_batch = 0
+        self._lock = threading.Lock()
         self.current_process = None
+        self._processed_or_queued = set()  # дедупликация: video_path строки
         
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
 
     def _get_ffmpeg_path(self):
+        # Сначала ищем системный ffmpeg (лучше поддерживает Unicode-пути)
+        system_ffmpeg = shutil.which("ffmpeg")
+        if system_ffmpeg:
+            return system_ffmpeg
+        # Запасной вариант — бандлёный ffmpeg
         local_ffmpeg = resource_path("ffmpeg.exe")
         if os.path.exists(local_ffmpeg):
             return local_ffmpeg
@@ -237,9 +267,15 @@ class Muxer(QObject):
             return False
 
     def enqueue_mux(self, video_path, audio_path, is_auto=False):
-        self.total_tasks_in_batch += 1
-        self.queue_progress.emit(self.completed_in_batch, self.total_tasks_in_batch)
-        self.task_queue.put((video_path, audio_path, is_auto))
+        log.info(f"enqueue_mux: video={video_path}, auto={is_auto}")
+        with self._lock:
+            if video_path in self._processed_or_queued:
+                log.info(f"enqueue_mux: SKIP duplicate {Path(video_path).name}")
+                return
+            self._processed_or_queued.add(video_path)
+            self.total_tasks_in_batch += 1
+            self.queue_progress.emit(self.completed_in_batch, self.total_tasks_in_batch)
+        self.task_queue.put((video_path, audio_path, is_auto, 0))
 
     def cancel_queue(self):
         with self.task_queue.mutex:
@@ -250,40 +286,67 @@ class Muxer(QObject):
                 self.current_process.kill()
             except Exception:
                 pass
-                
+        
+        with self._lock:
+            self._processed_or_queued.clear()
         self.total_tasks_in_batch = 0
         self.completed_in_batch = 0
         self.queue_progress.emit(0, 0)
 
+    def reset_batch(self):
+        """Явный сброс счётчиков перед новым пакетом."""
+        with self._lock:
+            self.total_tasks_in_batch = 0
+            self.completed_in_batch = 0
+            self._processed_or_queued.clear()
+
     def _worker_loop(self):
+        MAX_ATTEMPTS = 60  # 60 попыток × ~5с задержка ≈ 5 минут макс
         while True:
+            log.debug("_worker_loop: waiting for task...")
             item = self.task_queue.get()
             if item is None:
                 continue
                 
-            video_path, audio_path, is_auto = item
+            video_path, audio_path, is_auto = item[0], item[1], item[2]
+            attempt = item[3] if len(item) > 3 else 0
+            t0 = time.perf_counter()
+            log.info(f"_worker_loop: picked up task, video={Path(video_path).name}, is_auto={is_auto}, attempt={attempt}")
+            
+            requeued = False
             
             if is_auto:
-                retries = 0
-                while not (self.is_file_ready(video_path) and self.is_file_ready(audio_path)):
-                    time.sleep(1)
-                    retries += 1
-                    if retries > 300:
+                # Проверяем, что файлы вообще существуют перед ожиданием
+                if not (os.path.exists(video_path) and os.path.exists(audio_path)):
+                    log.warning(f"_worker_loop: files missing, dropping task ({Path(video_path).name})")
+                elif not (self.is_file_ready(video_path) and self.is_file_ready(audio_path)):
+                    if attempt < MAX_ATTEMPTS:
+                        log.debug(f"_worker_loop: files not ready, requeue (attempt {attempt+1}/{MAX_ATTEMPTS})")
+                        time.sleep(5)
+                        self.task_queue.put((video_path, audio_path, is_auto, attempt + 1))
+                        requeued = True
+                    else:
+                        log.error(f"_worker_loop: timeout waiting for files after {MAX_ATTEMPTS} attempts")
                         self.mux_finished.emit(video_path, False, self.config.t("timeout"))
-                        break
                 else:
+                    if attempt > 0:
+                        log.info(f"_worker_loop: files ready after {attempt} attempts")
                     self.do_mux(video_path, audio_path)
             else:
                 self.do_mux(video_path, audio_path)
-                
-            if self.total_tasks_in_batch > 0:
-                self.completed_in_batch += 1
-                self.queue_progress.emit(self.completed_in_batch, self.total_tasks_in_batch)
             
-            if self.task_queue.empty():
-                self.total_tasks_in_batch = 0
-                self.completed_in_batch = 0
-                self.queue_progress.emit(0, 0)
+            elapsed = time.perf_counter() - t0
+            log.info(f"_worker_loop: task finished in {elapsed:.2f}s")
+                
+            with self._lock:
+                if not requeued and self.total_tasks_in_batch > 0:
+                    self.completed_in_batch += 1
+                    self.queue_progress.emit(self.completed_in_batch, self.total_tasks_in_batch)
+                
+                if self.task_queue.empty():
+                    self.total_tasks_in_batch = 0
+                    self.completed_in_batch = 0
+                    self.queue_progress.emit(0, 0)
                 
             self.task_queue.task_done()
 
@@ -308,12 +371,48 @@ class Muxer(QObject):
                 time.sleep(0.5)
         return False
 
+    def _get_duration(self, filepath):
+        """Получить длительность файла в секундах через ffmpeg."""
+        t0 = time.perf_counter()
+        try:
+            cmd = [self.ffmpeg_path, "-i", str(filepath)]
+            creationflags = 0x08000000 if os.name == 'nt' else 0
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                creationflags=creationflags, timeout=10,
+                encoding='utf-8', errors='replace'
+            )
+            elapsed = time.perf_counter() - t0
+            match = re.search(r"Duration:\s*(\d+):(\d+):(\d+)\.(\d+)", result.stderr)
+            if match:
+                h, m, s, cs = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+                dur = h * 3600 + m * 60 + s + cs / 100.0
+                log.info(f"_get_duration: {dur}s (probe took {elapsed:.2f}s)")
+                return dur
+            log.warning(f"_get_duration: no Duration found in stderr (probe took {elapsed:.2f}s)")
+        except Exception as e:
+            elapsed = time.perf_counter() - t0
+            log.error(f"_get_duration: exception {e} after {elapsed:.2f}s")
+        return 0
+
     def do_mux(self, video_path, audio_path):
         video_path = Path(video_path)
         audio_path = Path(audio_path)
         
+        # Early return: файлы могли быть перемещены/удалены предыдущей задачей
+        if not video_path.exists() or not audio_path.exists():
+            log.warning(f"do_mux SKIP: files missing — video={video_path.exists()}, audio={audio_path.exists()} ({video_path.name})")
+            return
+        
         output_name = video_path.stem + "_merged.mp4"
         output_path = video_path.parent / output_name
+        log.info(f"do_mux START: {video_path.name}")
+        log.info(f"  video: {video_path} (exists={video_path.exists()}, size={video_path.stat().st_size if video_path.exists() else 'N/A'})")
+        log.info(f"  audio: {audio_path} (exists={audio_path.exists()})")
+        log.info(f"  output: {output_path}")
+
+        duration = self._get_duration(str(video_path))
+        self.file_progress.emit(0)
 
         cmd = [
             self.ffmpeg_path,
@@ -323,35 +422,91 @@ class Muxer(QObject):
             "-map", "0",
             "-map", "1:a",
             "-c", "copy",
+            "-progress", "pipe:1",
             str(output_path)
         ]
+        log.info(f"  cmd: {' '.join(cmd)}")
 
         try:
             creationflags = 0x08000000 if os.name == 'nt' else 0
-            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=creationflags)
-            stdout, stderr = self.current_process.communicate()
+            t_popen = time.perf_counter()
+            self.current_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=creationflags, text=True,
+                bufsize=1, encoding='utf-8', errors='replace'
+            )
+            log.info(f"  Popen started (pid={self.current_process.pid}) in {time.perf_counter()-t_popen:.3f}s")
+            
+            # Дренируем stderr в отдельном потоке чтобы не было дедлока
+            stderr_lines = []
+            def drain_stderr():
+                for line in self.current_process.stderr:
+                    stderr_lines.append(line)
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+            stderr_thread.start()
+            
+            # Парсим прогресс из stdout (-progress pipe:1)
+            t_read = time.perf_counter()
+            line_count = 0
+            last_pct = -1
+            for line in iter(self.current_process.stdout.readline, ''):
+                line = line.strip()
+                line_count += 1
+                if line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=")[1])
+                        if duration > 0 and us >= 0:
+                            pct = min(int((us / 1_000_000) / duration * 100), 100)
+                            if pct != last_pct:
+                                log.debug(f"  progress: {pct}% (at {time.perf_counter()-t_read:.2f}s)")
+                                last_pct = pct
+                            self.file_progress.emit(pct)
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                elif line.startswith("progress="):
+                    log.info(f"  ffmpeg progress={line.split('=')[1]} (at {time.perf_counter()-t_read:.2f}s)")
+            
+            t_stdout_done = time.perf_counter()
+            log.info(f"  stdout finished: {line_count} lines in {t_stdout_done-t_read:.2f}s")
+            
+            self.current_process.wait()
+            t_wait = time.perf_counter()
+            log.info(f"  process.wait() took {t_wait-t_stdout_done:.3f}s, returncode={self.current_process.returncode}")
+            
+            stderr_thread.join(timeout=5)
+            if stderr_lines:
+                log.info(f"  stderr ({len(stderr_lines)} lines): ...{stderr_lines[-1].strip()}")
             
             if self.current_process.returncode == 0:
+                self.file_progress.emit(100)
+                t_post = time.perf_counter()
                 if self.config.get("delete_originals"):
+                    log.info("  post: deleting originals...")
                     if not self.safe_remove(str(video_path)):
-                        print(f"Failed to delete {video_path}")
+                        log.warning(f"  Failed to delete {video_path}")
                     if not self.safe_remove(str(audio_path)):
-                        print(f"Failed to delete {audio_path}")
+                        log.warning(f"  Failed to delete {audio_path}")
                 elif self.config.get("move_originals"):
+                    log.info("  post: moving originals...")
                     try:
                         original_dir = video_path.parent / "original"
                         original_dir.mkdir(exist_ok=True)
                         if not self.safe_move(video_path, original_dir / video_path.name):
-                            print(f"Failed to move {video_path}")
+                            log.warning(f"  Failed to move {video_path}")
                         if not self.safe_move(audio_path, original_dir / audio_path.name):
-                            print(f"Failed to move {audio_path}")
+                            log.warning(f"  Failed to move {audio_path}")
                     except Exception as e:
-                        print(f"Failed to process move: {e}")
+                        log.error(f"  Failed to process move: {e}")
+                log.info(f"  post-processing took {time.perf_counter()-t_post:.2f}s")
                         
                 self.mux_finished.emit(str(video_path), True, self.config.t("success_msg", name=video_path.name))
+                log.info(f"do_mux SUCCESS: {video_path.name}")
             else:
+                log.error(f"do_mux FAILED: returncode={self.current_process.returncode}")
+                log.error(f"  stderr: {''.join(stderr_lines[-5:])}")
                 self.mux_finished.emit(str(video_path), False, self.config.t("ffmpeg_err"))
         except Exception as e:
+            log.exception(f"do_mux EXCEPTION: {e}")
             self.mux_finished.emit(str(video_path), False, f"Ошибка: {str(e)}")
         finally:
             self.current_process = None
@@ -508,6 +663,7 @@ class SettingsDialog(QDialog):
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabel(self.config.t("tree_header"))
+        self.tree.itemChanged.connect(self.on_item_changed)
         manual_layout.addWidget(self.tree)
         
         self.status_label = QLabel(self.config.t("queue_empty"))
@@ -533,6 +689,7 @@ class SettingsDialog(QDialog):
 
         self.found_pairs = {} 
         self.muxer.queue_progress.connect(self.update_progress)
+        self.muxer.file_progress.connect(self.update_file_progress)
 
     def change_language(self, index):
         lang_code = self.cb_lang.itemData(index)
@@ -568,6 +725,7 @@ class SettingsDialog(QDialog):
             QMessageBox.warning(self, self.config.t("err_title"), self.config.t("err_no_folder"))
             return
 
+        self.tree.blockSignals(True)
         self.tree.clear()
         self.found_pairs = {}
         
@@ -607,7 +765,7 @@ class SettingsDialog(QDialog):
                             self.found_pairs[str(video_path)] = str(audio_path)
 
         self.tree.expandAll()
-        self.tree.itemChanged.connect(self.on_item_changed)
+        self.tree.blockSignals(False)
         
         if not self.found_pairs:
             QMessageBox.information(self, self.config.t("res_title"), self.config.t("res_no_files"))
@@ -632,6 +790,7 @@ class SettingsDialog(QDialog):
         self.tree.blockSignals(False)
 
     def merge_selected(self):
+        self.muxer.reset_batch()
         count = 0
         for i in range(self.tree.topLevelItemCount()):
             folder_item = self.tree.topLevelItem(i)
@@ -643,9 +802,6 @@ class SettingsDialog(QDialog):
                     if audio_path:
                         self.muxer.enqueue_mux(video_path, audio_path, is_auto=False)
                         count += 1
-                        
-        if count > 0:
-            self.scan_folder()
 
     def cancel_queue(self):
         self.muxer.cancel_queue()
@@ -653,14 +809,21 @@ class SettingsDialog(QDialog):
     def update_progress(self, current, total):
         if total > 0:
             self.progress_bar.setVisible(True)
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(current)
+            self.progress_bar.setMaximum(100)
             self.status_label.setText(self.config.t("processing", cur=current, tot=total))
             self.cancel_btn.setEnabled(True)
         else:
             self.progress_bar.setVisible(False)
+            self.progress_bar.setValue(0)
             self.status_label.setText(self.config.t("queue_empty"))
             self.cancel_btn.setEnabled(False)
+            # Пересканируем после завершения пакета
+            if self.found_pairs:
+                self.scan_folder()
+
+    def update_file_progress(self, percent):
+        """Обновляет прогресс-бар для текущего файла."""
+        self.progress_bar.setValue(percent)
 
 
 class TrayApp:
